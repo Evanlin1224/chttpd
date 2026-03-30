@@ -1,0 +1,7 @@
+*.o
+chttpd
+obj/
+bin/
+.DS_Store
+*.swp
+*.log
