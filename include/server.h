@@ -63,7 +63,8 @@ int parse_http_request(char *raw_data, http_request_t *request);
  * @param status_code The HTTP status code (e.g., 200).
  * @param status_msg The HTTP status message (e.g., "OK").
  * @param body The response body.
+ * @param content_type The MIME type of the response body.
  */
-void send_response(int client_fd, const int status_code, const char *status_msg, const char *body);
+void send_response(int client_fd, const int status_code, const char *status_msg, const char *body, const char *content_type);
 
 #endif // SERVER_H

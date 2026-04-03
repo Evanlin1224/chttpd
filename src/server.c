@@ -1,4 +1,4 @@
-#define _GNU_SOURCE // Enable GNU extensions for better error handling and socket options
+#define _GNU_SOURCE 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,36 +6,88 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include "server.h"
+#include "utils/path_utils.h"
+#include "utils/mime_utils.h"
+
+// Helper function to serve a static file
+void serve_file(int client_fd, const char *full_path) {
+    FILE *file = fopen(full_path, "rb");
+    
+    // If file is not found, try to serve 404.html
+    if (file == NULL) {
+        perror("fopen failed");
+        // Try serving our custom 404 page
+        file = fopen("public/404.html", "rb");
+        if (file == NULL) {
+            // Ultimate fallback if even 404.html is missing
+            const char *not_found_msg = "<h1>404 Not Found</h1>";
+            send_response(client_fd, 404, "Not Found", not_found_msg, "text/html");
+            return;
+        }
+        
+        // If we found 404.html, we need to send the 404 status code header first
+        struct stat st;
+        stat("public/404.html", &st);
+        char header[1024];
+        snprintf(header, sizeof(header), 
+                 "HTTP/1.1 404 Not Found\r\n"
+                 "Content-Type: text/html\r\n"
+                 "Content-Length: %ld\r\n"
+                 "Connection: close\r\n\r\n", 
+                 st.st_size);
+        send(client_fd, header, strlen(header), 0);
+    } else {
+        // Normal 200 OK case
+        struct stat st;
+        stat(full_path, &st);
+        long file_size = st.st_size;
+        const char *content_type = get_mime_type(full_path);
+
+        char header[1024];
+        snprintf(header, sizeof(header), 
+                 "HTTP/1.1 200 OK\r\n"
+                 "Content-Type: %s\r\n"
+                 "Content-Length: %ld\r\n"
+                 "Connection: close\r\n\r\n", 
+                 content_type, file_size);
+        send(client_fd, header, strlen(header), 0);
+    }
+
+    // Common file sending logic
+    char buffer[4096];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        send(client_fd, buffer, bytes_read, 0);
+    }
+
+    fclose(file);
+}
 
 int server_init(http_server_t *server, int port) {
     server->port = port;
     int opt = 1;
 
-    // Create socket
     if ((server->server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
         perror("socket failed");
         return -1;
     }
 
-    // Set socket options to reuse address and port
     if (setsockopt(server->server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
         perror("setsockopt failed");
         return -1;
     }
 
     server->address.sin_family = AF_INET;
-    // INADDR_ANY allows the server to accept connections on any of the host's IP addresses
     server->address.sin_addr.s_addr = INADDR_ANY; 
     server->address.sin_port = htons(server->port);
 
-    // Bind socket to the address and port
     if (bind(server->server_fd, (struct sockaddr *)&server->address, sizeof(server->address)) < 0) {
         perror("bind failed");
         return -1;
     }
 
-    // Start listening
     if (listen(server->server_fd, BACKLOG) < 0) {
         perror("listen failed");
         return -1;
@@ -67,41 +119,45 @@ void server_start(http_server_t *server) {
 }
 
 void handle_client(int client_fd) {
-    char buffer[1024] = {0};
+    char buffer[2048] = {0};
+    char full_path[1024] = {0};
     http_request_t request;
-    read(client_fd, buffer, 1024); // read from client (web browser)
-    printf("Received request:\n%s\n", buffer);
+    
+    // Read the request
+    ssize_t bytes_received = read(client_fd, buffer, sizeof(buffer) - 1);
+    if (bytes_received < 0) {
+        perror("read failed");
+        close(client_fd);
+        return;
+    }
+    buffer[bytes_received] = '\0';
 
     // Parse the HTTP request
     if (parse_http_request(buffer, &request) == -1) {
         printf("Failed to parse HTTP request\n");
-        send_response(client_fd, 400, "Bad Request", "Invalid HTTP request format");
-    } else if (strcmp(request.path, "/") == 0) {
-        // TODO: I think we should have a more robust routing mechanism, but for now we will just check if the path is "/" and return a simple response.
-        send_response(client_fd, 200, "OK", "Welcome to the C HTTP Server!");
+        send_response(client_fd, 400, "Bad Request", "<h1>400 Bad Request</h1>", "text/html");
     } else {
-        send_response(client_fd, 404, "Not Found", "The requested resource was not found on this server.");
+        // Resolve URL to file path
+        get_full_path(request.path, full_path);
+        printf("Serving file: %s\n", full_path);
+        
+        // Serve the file
+        serve_file(client_fd, full_path);
     }
 
-    printf("Parsed Request - Method: %s, Path: %s, Version: %s\n", request.method, request.path, request.version);
     close(client_fd);
 }
 
 int parse_http_request(char *raw_data, http_request_t *request) {
-    // 1. parse the request line (e.g., "GET /index.html HTTP/1.1")
     char *line_end = strstr(raw_data, "\r\n");  
-    if (!line_end) {
-        return -1;
-    }
+    if (!line_end) return -1;
     *line_end = '\0';
-    /* FIXME: Using strtok is mutable, so we need to be careful */
+
     char *method = strtok(raw_data, " ");
     char *path = strtok(NULL, " ");
     char *version = strtok(NULL, " ");
 
-    if (!method || !path || !version) {
-        return -1;
-    }
+    if (!method || !path || !version) return -1;
 
     strncpy(request->method, method, sizeof(request->method) - 1);
     request->method[sizeof(request->method) - 1] = '\0';
@@ -110,19 +166,18 @@ int parse_http_request(char *raw_data, http_request_t *request) {
     strncpy(request->version, version, sizeof(request->version) - 1);
     request->version[sizeof(request->version) - 1] = '\0';
 
-
-    // 2. parse the body (for simplicity, we assume the body starts after the first blank line)
-
-    // 3. In a real implementation, we would also need to parse headers to determine the content length and properly read the body, but for now we will just copy the remaining data as the body.
-
     return 0;
 }
 
-void send_response(int client_fd, const int status_code, const char *status_msg, const char *body) {
-    char header[2048];
+void send_response(int client_fd, const int status_code, const char *status_msg, const char *body, const char *content_type) {
+    char header[1024];
     int body_length = strlen(body);
-    snprintf(header, sizeof(header), "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n", 
-             status_code, status_msg, body_length);
+    snprintf(header, sizeof(header), 
+             "HTTP/1.1 %d %s\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n", 
+             status_code, status_msg, content_type, body_length);
     send(client_fd, header, strlen(header), 0);
 
     if (body_length > 0) {
